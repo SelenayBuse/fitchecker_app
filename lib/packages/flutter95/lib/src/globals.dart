@@ -82,20 +82,23 @@ class Flutter95 {
   );
 
   static const headerTextStyle = TextStyle(
+    fontFamily: 'Flutter95',
     color: Color(0xFFFFFFFF),
-    fontSize: 16,
+    fontSize: 26,
     decoration: TextDecoration.none,
     fontWeight: FontWeight.bold,
   );
 
   static const textStyle = TextStyle(
+    fontFamily: 'Flutter95',
     color: Flutter95.black,
-    fontSize: 14,
+    fontSize: 20,
     decoration: TextDecoration.none,
     fontWeight: FontWeight.normal,
   );
 
   static final disabledTextStyle = TextStyle(
+    fontFamily: 'Flutter95',
     color: Flutter95.pinks[3], // Pasif yazı rengi için yeni paletimiz
     fontSize: 14,
     decoration: TextDecoration.none,

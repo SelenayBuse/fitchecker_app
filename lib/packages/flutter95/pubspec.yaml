@@ -22,3 +22,5 @@ flutter:
     - icons/icon_error.png
     - icons/checkmark.png
     - icons/checkmark_disabled.png
+    - icons/error_gif.png
+    - icons/success_gif.png

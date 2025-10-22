@@ -14,8 +14,10 @@ Future<T?> showMenu95<T>(
       textStyle: Flutter95.textStyle,
       height: 32,
       child: Text(
-        item.label,
-      ),
+          item.label,
+          style: Flutter95.textStyle, // <-- EKSİK OLAN SATIR BUYDU!
+        ),
+
     );
   }).toList();
 
