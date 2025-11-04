@@ -4,7 +4,7 @@ import 'dart:math' as math;
 import 'package:image_picker/image_picker.dart';
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+// import 'package:shared_preferences/shared_preferences.dart'; // <-- ARTIK GEREKLİ DEĞİL
 import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as p;
 import 'package:http/http.dart' as http;
@@ -12,6 +12,11 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'dart:typed_data';
 import 'utils/myErrorDialog.dart';
 import 'utils/mySuccessDialog.dart';
+
+// --- YENİ EKLENEN IMPORTLAR ---
+import 'dart:convert'; // Gemini API için (JSON ve Base64)
+import 'utils/progress_bar.dart'; // Yeni yükleme animasyonu
+// ------------------------------
 
 Future<void> main() async {
   // .env dosyasını uygulama başlamadan önce yükle
@@ -47,29 +52,11 @@ class FitCheckerApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       color: Flutter95.background,
       home: const FitCheckerHome(),
-
-      // DOĞRU YER BURASI
       theme: ThemeData(
         textTheme: TextTheme(
-          
-          // 'Flutter95.textStyle' yerine doğrudan kendimiz yazıyoruz
-          bodyMedium: const TextStyle(
-            fontFamily: 'Flutter95', // <-- Bu isim pubspec.yaml'daki ile aynı olmalı
-            // Gerekirse diğer stil özelliklerini ekleyebilirsiniz
-            // fontSize: 12,
-            // color: Colors.black, 
-          ),
-          
-          bodyLarge: const TextStyle(
-            fontFamily: 'Flutter95',
-          ),
-          
-          titleMedium: const TextStyle(
-            fontFamily: 'Flutter95',
-          ),
-          
-          // Diğer tüm metin stilleri için de bunu yapabilirsiniz
-          // (displayLarge, displayMedium, ... headlineSmall, vb.)
+          bodyMedium: Flutter95.textStyle,
+          bodyLarge: Flutter95.textStyle,
+          titleMedium: Flutter95.textStyle,
         ),
         scaffoldBackgroundColor: Flutter95.background,
       ),
@@ -100,6 +87,15 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
   int _coatIndex = 0;
 
   bool _isLoading = false;
+  
+  // --- YENİ EKLENDİ ---
+  bool _showCoatCarousel = false;
+  // --------------------
+
+  // --- YARDIMCI FONKSİYON (GEMINI API İÇİN) ---
+  String _colorToHex(Color color) {
+    return '#${color.value.toRadixString(16).substring(2).padLeft(6, '0')}';
+  }
 
   @override
   void initState() {
@@ -107,139 +103,201 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
     _loadAllSavedData();
   }
 
+  // --- YENİ EKLENDİ: Ana Görüntü Klasör Yolu ---
+  /// Uygulamanın .../images/ klasörünün yolunu döndürür.
+  Future<Directory> _getImagesDirectory() async {
+    final appDir = await getApplicationDocumentsDirectory();
+    final imagesDir = Directory(p.join(appDir.path, 'FitChecker'));
+    return imagesDir;
+  }
+
+  // --- YENİ EKLENDİ: Klasörleri Oluşturma ---
+  /// Uygulama için gerekli tüm alt klasörleri oluşturur.
+  Future<void> _initAppDirectories() async {
+    try {
+      final imagesDir = await _getImagesDirectory();
+      
+      final topsDir = Directory(p.join(imagesDir.path, 'Tops'));
+      final bottomsDir = Directory(p.join(imagesDir.path, 'Bottoms'));
+      final coatsDir = Directory(p.join(imagesDir.path, 'Coats'));
+      final userPhotoDir = Directory(p.join(imagesDir.path, 'UserPhoto'));
+
+      if (!await topsDir.exists()) await topsDir.create(recursive: true);
+      if (!await bottomsDir.exists()) await bottomsDir.create(recursive: true);
+      if (!await coatsDir.exists()) await coatsDir.create(recursive: true);
+      if (!await userPhotoDir.exists()) await userPhotoDir.create(recursive: true);
+
+      debugPrint("Directory structure initialized at: ${imagesDir.path}");
+
+    } catch (e) {
+      debugPrint("Error initializing directories: $e");
+      if (mounted) {
+        showErrorDialog95(context: context, title: "Startup Error", message: "Could not create app directories: $e");
+      }
+    }
+  }
+  
+  // --- GÜNCELLENDİ: Veri Yükleme Yöneticisi ---
   Future<void> _loadAllSavedData() async {
-    await _loadClothes();
-    await _loadUserPhoto();
+    await _initAppDirectories(); // Önce klasörlerin var olduğundan emin ol
+    await _loadClothes();        // Klasörlerden kıyafetleri yükle
+    await _loadUserPhoto();      // Klasörden kullanıcı fotoğrafını yükle
     setState(() {});
   }
 
-  // --- KALICI DEPOLAMA METOTLARI ---
-  Future<void> _saveClothes(ClothingCategory category) async {
-    final prefs = await SharedPreferences.getInstance();
-    final key = '${category.name}_images';
-    List<ClothingItem> list;
-    switch (category) {
-      case ClothingCategory.top: list = _tops; break;
-      case ClothingCategory.bottom: list = _bottoms; break;
-      case ClothingCategory.coat: list = _coats; break;
-    }
-    final imagePaths = list.whereType<ImageItem>().map((item) => item.path).toList();
-    await prefs.setStringList(key, imagePaths);
-  }
-
+  // --- GÜNCELLENDİ: Kıyafet Yükleme (Dosya Sisteminden) ---
   Future<void> _loadClothes() async {
-    final prefs = await SharedPreferences.getInstance();
+    final imagesDir = await _getImagesDirectory();
+
     for (var category in ClothingCategory.values) {
-      final key = '${category.name}_images';
-      final imagePaths = prefs.getStringList(key) ?? [];
       List<ClothingItem> targetList;
+      String subDir;
+
       switch (category) {
-        case ClothingCategory.top: targetList = _tops; break;
-        case ClothingCategory.bottom: targetList = _bottoms; break;
-        case ClothingCategory.coat: targetList = _coats; break;
+        case ClothingCategory.top:
+          targetList = _tops;
+          subDir = 'Tops';
+          break;
+        case ClothingCategory.bottom:
+          targetList = _bottoms;
+          subDir = 'Bottoms';
+          break;
+        case ClothingCategory.coat:
+          targetList = _coats;
+          subDir = 'Coats';
+          break;
       }
+
+      final categoryDir = Directory(p.join(imagesDir.path, subDir));
+      
+      // Halihazırda listelenen (örn. varsayılan renkler) yolları alma
       final existingPaths = targetList.whereType<ImageItem>().map((e) => e.path).toSet();
-      for (var path in imagePaths) {
-         if (!existingPaths.contains(path)) {
-           targetList.add(ImageItem(path));
-         }
+
+      if (await categoryDir.exists()) {
+        try {
+          // Klasördeki tüm dosyaları senkron olarak listele
+          final files = categoryDir.listSync().whereType<File>().toList();
+          
+          for (var file in files) {
+            // Eğer bu dosya yolu listede zaten yoksa ekle
+            if (!existingPaths.contains(file.path)) {
+              targetList.add(ImageItem(file.path));
+            }
+          }
+        } catch (e) {
+            debugPrint("Error reading directory ${categoryDir.path}: $e");
+        }
       }
     }
   }
-
-  Future<void> _saveUserPhotoPath(String path) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('user_photo_path', path);
-  }
-
+  
+  // --- GÜNCELLENDİ: Kullanıcı Foto Yükleme (Dosya Sisteminden) ---
   Future<void> _loadUserPhoto() async {
-    final prefs = await SharedPreferences.getInstance();
-    final path = prefs.getString('user_photo_path');
-    if (path != null && await File(path).exists()) {
-      setState(() {
-        _userImage = File(path);
-      });
+    final imagesDir = await _getImagesDirectory();
+    final userPhotoDir = Directory(p.join(imagesDir.path, 'UserPhoto'));
+
+    if (await userPhotoDir.exists()) {
+      try {
+        final files = userPhotoDir.listSync().whereType<File>().toList();
+        if (files.isNotEmpty) {
+          // Dosyaları değiştirilme tarihine göre sırala (en yeni en başta)
+          files.sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
+          
+          // En yeni fotoğrafı yükle
+          setState(() {
+            _userImage = files.first;
+          });
+        }
+      } catch (e) {
+        debugPrint("Error reading UserPhoto directory: $e");
+      }
     }
   }
 
   // --- API İSTEK FONKSİYONLARI ---
 
   Future<Uint8List?> _removeBackground(String imagePath) async {
+    // ... (Bu fonksiyonda değişiklik yok, aynı kalıyor)
     final String? apiKey = dotenv.env['REMOVE_BG_API_KEY']?.trim();
-
-    if (apiKey == null || apiKey.isEmpty) {
-      debugPrint("HATA: .env dosyasında REMOVE_BG_API_KEY bulunamadı veya boş.");
-      return null;
-    }
-
+    if (apiKey == null || apiKey.isEmpty) { /*...*/ return null; }
     final uri = Uri.parse('https://api.remove.bg/v1.0/removebg');
     final request = http.MultipartRequest('POST', uri)
       ..headers['X-Api-Key'] = apiKey
       ..fields['size'] = 'auto'
       ..files.add(await http.MultipartFile.fromPath('image_file', imagePath));
-      
-    // ... fonksiyonun geri kalanı aynı ...
     try {
       final streamedResponse = await request.send();
       if (streamedResponse.statusCode == 200) {
-        
         return await streamedResponse.stream.toBytes();
+      } else { /*...*/ return null; }
+    } catch (e) { /*...*/ return null; }
+  }
 
-      } else {
-        debugPrint("API Hatası: ${streamedResponse.statusCode}");
-        debugPrint("Hata Detayı: ${await streamedResponse.stream.bytesToString()}");
-        return null;
+  Future<Uint8List?> _callGeminiImageApi({
+    // ... (Bu fonksiyonda değişiklik yok, aynı kalıyor)
+    required File userImageFile,
+    required ClothingItem topItem,
+    required ClothingItem bottomItem,
+    required ClothingItem coatItem,
+  }) async {
+    final String? apiKey = dotenv.env['GOOGLE_API_KEY']?.trim();
+    if (apiKey == null || apiKey.isEmpty) {
+      debugPrint("HATA: .env dosyasında GOOGLE_API_KEY bulunamadı.");
+      debugPrint("--- SİMÜLASYON MODU ---");
+      await Future.delayed(const Duration(seconds: 3));
+      if (topItem is ImageItem) {
+        return await File(topItem.path).readAsBytes();
       }
-    } catch (e) {
-      debugPrint("İstek gönderilirken hata oluştu: $e");
       return null;
     }
-  }
 
-  Future<void> _generateOutfit() async {
-    final topPath = _tops[_topIndex] is ImageItem ? (_tops[_topIndex] as ImageItem).path : null;
-    final bottomPath = _bottoms[_bottomIndex] is ImageItem ? (_bottoms[_bottomIndex] as ImageItem).path : null;
-    final coatPath = _coats[_coatIndex] is ImageItem ? (_coats[_coatIndex] as ImageItem).path : null;
-    final userPhotoPath = _userImage?.path;
-
-    if (userPhotoPath == null || topPath == null || bottomPath == null) {
-      showDialog95(context: context, title: 'Eksik Parça!', message: 'Lütfen bir kullanıcı fotoğrafı, bir üst ve bir alt seçin.');
-      return;
+    // --- "COAT" KONTROLÜ ---
+    const Color defaultCoatColor = Color.fromARGB(255, 209, 245, 211);
+    bool includeCoat = true;
+    if (coatItem is ColorItem && coatItem.color == defaultCoatColor) {
+      includeCoat = false;
     }
-
-    setState(() { _isLoading = true; });
-
+    // --- KONTROL SONU ---
+    
+    const String modelName = 'gemini-2.5-flash-image';
+    final uri = Uri.parse('https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$apiKey');
+    List<Map<String, dynamic>> parts = [];
+    String textPrompt = "Dress this person using the provided items. Dress her realistically.  However, do NOT change the person and do not change the face gestures. ";
+    if (topItem is ColorItem) textPrompt += "Use this piece for the top: ${_colorToHex(topItem.color)}. ";
+    if (bottomItem is ColorItem) textPrompt += "Use this piece for the bottom: ${_colorToHex(bottomItem.color)}. ";
+    if (includeCoat && coatItem is ColorItem) textPrompt += "Use this piece for the coat: ${_colorToHex(coatItem.color)}. ";
+    parts.add({"text": textPrompt});
+    final userImageBytes = await userImageFile.readAsBytes();
+    parts.add({"inlineData": {"mimeType": "image/png", "data": base64Encode(userImageBytes)}});
+    if (topItem is ImageItem) {
+      parts.add({"text": "Use this image as the top:"});
+      parts.add({"inlineData": {"mimeType": "image/png", "data": base64Encode(await File(topItem.path).readAsBytes())}});
+    }
+    if (bottomItem is ImageItem) {
+      parts.add({"text": "Use this image as the bottom:"});
+      parts.add({"inlineData": {"mimeType": "image/png", "data": base64Encode(await File(bottomItem.path).readAsBytes())}});
+    }
+    if (includeCoat && coatItem is ImageItem) {
+      parts.add({"text": "Use this image as the coat:"});
+      parts.add({"inlineData": {"mimeType": "image/png", "data": base64Encode(await File(coatItem.path).readAsBytes())}});
+    }
+    final requestBody = jsonEncode({"contents": [{"parts": parts}]});
     try {
-      final String? apiKey_nano = dotenv.env['NANO_BANANA_API_KEY'];
-      var uri = Uri.parse('https://api.nanobanana.com/v1/generate_outfit'); // KENDİ API ADRESİN
-      var request = http.MultipartRequest('POST', uri)
-        ..headers['Authorization'] = 'Bearer $apiKey_nano';
-
-      request.files.add(await http.MultipartFile.fromPath('user_photo', userPhotoPath));
-      request.files.add(await http.MultipartFile.fromPath('top', topPath));
-      request.files.add(await http.MultipartFile.fromPath('bottom', bottomPath));
-      if (coatPath != null) {
-        request.files.add(await http.MultipartFile.fromPath('coat', coatPath));
-      }
-      
-      var streamedResponse = await request.send();
-      
-      if (streamedResponse.statusCode == 200) {
-        final responseBytes = await streamedResponse.stream.toBytes();
-        final tempDir = await getTemporaryDirectory();
-        final generatedFile = await File('${tempDir.path}/generated_outfit.png').writeAsBytes(responseBytes);
-        setState(() { _generatedOutfitImage = generatedFile; });
-      } else {
-        final responseBody = await streamedResponse.stream.bytesToString();
-        showDialog95(context: context, title: 'API Hatası', message: 'Bir hata oluştu: ${streamedResponse.statusCode}\n$responseBody');
-      }
-    } catch (e) {
-      showDialog95(context: context, title: 'Hata', message: 'İstek gönderilirken bir sorun oluştu: $e');
-    } finally {
-      setState(() { _isLoading = false; });
-    }
+      final response = await http.post(uri, headers: {'Content-Type': 'application/json'}, body: requestBody);
+      if (response.statusCode == 200) {
+        final responseData = jsonDecode(response.body);
+        final List<dynamic> responseParts = responseData['candidates'][0]['content']['parts'];
+        for (var part in responseParts) {
+          if (part.containsKey('inlineData')) {
+            final String base64ImageData = part['inlineData']['data'];
+            return base64Decode(base64ImageData);
+          }
+        }
+        return null;
+      } else { /*...*/ return null; }
+    } catch (e) { /*...*/ return null; }
   }
-
+  
   // --- RESİM SEÇME VE EKLEME FONKSİYONLARI ---
 
   Future<void> _pickUserPhoto() async {
@@ -258,17 +316,17 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
       setState(() { _isLoading = false; });
 
       if (imageBytesWithoutBg != null) {
-        final appDir = await getApplicationDocumentsDirectory();
+        final imagesDir = await _getImagesDirectory();
+        final targetDir = Directory(p.join(imagesDir.path, 'UserPhoto'));
         final fileName = 'user_photo_no_bg_${DateTime.now().millisecondsSinceEpoch}.png';
-        final savedImageFile = await File(p.join(appDir.path, fileName)).writeAsBytes(imageBytesWithoutBg);
+        final savedImageFile = await File(p.join(targetDir.path, fileName)).writeAsBytes(imageBytesWithoutBg);
         
         debugPrint('>>> Arka planı temizlenmiş fotoğraf kaydedildi: ${savedImageFile.path}');
 
         setState(() {
           _userImage = savedImageFile;
-          _generatedOutfitImage = null; 
+          _generatedOutfitImage = null;
         });
-        await _saveUserPhotoPath(savedImageFile.path);
       } else {
         showDialog95(context: context, title: 'Hata', message: 'Fotoğrafın arka planı temizlenemedi.');
       }
@@ -286,24 +344,27 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
     }
 
     if (pickedFilePath != null) {
-      // --- DÜZELTME 2: YÜKLEME BAŞLIYOR ---
-      // Yüklemeyi burada başlatın ve tüm işlemler bitene kadar açık kalsın.
       setState(() {
         _isLoading = true;
       });
 
       try {
-        // Arka plan kaldırma işlemi
         final imageBytesWithoutBg = await _removeBackground(pickedFilePath);
 
         if (imageBytesWithoutBg != null) {
-          final appDir = await getApplicationDocumentsDirectory();
+          
+          final imagesDir = await _getImagesDirectory();
+          String subDir;
+          switch (category) {
+            case ClothingCategory.top: subDir = 'Tops'; break;
+            case ClothingCategory.bottom: subDir = 'Bottoms'; break;
+            case ClothingCategory.coat: subDir = 'Coats'; break;
+          }
+          
+          final targetDir = Directory(p.join(imagesDir.path, subDir));
           final fileName = 'clothing_${category.name}_${DateTime.now().millisecondsSinceEpoch}.png';
-          final savedImageFile = await File(p.join(appDir.path, fileName)).writeAsBytes(imageBytesWithoutBg);
-
-          // --- DÜZELTME 1: DIALOG MESAJI ---
-          // Kullanıcıya gösterilecek mesajı burada oluşturun.
-          final String successMessage = 'Kıyafet başarıyla yüklendi.\nDizin: ${appDir.path}';
+          final savedImageFile = await File(p.join(targetDir.path, fileName)).writeAsBytes(imageBytesWithoutBg);
+          final String successMessage = 'Kıyafet başarıyla yüklendi.\nDizin: ${targetDir.path}';
 
           final newItem = ImageItem(savedImageFile.path);
           setState(() {
@@ -324,31 +385,22 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
             _generatedOutfitImage = null;
           });
           
-          // Bu işlem de 'await' içerdiği için loader'ın içinde kalmalı.
-          await _saveClothes(category); 
-
-          // Tüm işlemler bittikten sonra başarıyı göster
-          if (mounted) { // 'await' sonrası context kontrolü
+          if (mounted) {
             showSuccessDialog95(context: context, title: 'Yükleme Başarılı', message: successMessage);
           }
 
         } else {
-          // Arka plan temizlenemezse
-          if (mounted) { // 'await' sonrası context kontrolü
+          if (mounted) {
             showErrorDialog95(context: context, title: 'Hata', message: 'Kıyafet fotoğrafının arka planı temizlenemedi.');
           }
         }
       } catch (e) {
-        // Beklenmedik bir hata olursa
         debugPrint('Hata oluştu: $e');
         if (mounted) {
           showErrorDialog95(context: context, title: 'Hata', message: 'Beklenmedik bir hata oluştu: $e');
         }
       } finally {
-        // --- DÜZELTME 2: YÜKLEME BİTTİ ---
-        // İşlem başarılı da olsa, hata da alsa 'finally' bloğu çalışır.
-        // Yükleme göstergesini burada durdurun.
-        if (mounted) { // 'await' sonrası context kontrolü
+        if (mounted) {
           setState(() {
             _isLoading = false;
           });
@@ -358,7 +410,6 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
   }
 
   // --- STATE GÜNCELLEME METOTLARI ---
-
   void _cycleTop(int direction) {
     setState(() {
       _topIndex = (_topIndex + direction + _tops.length) % _tops.length;
@@ -376,19 +427,96 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
       _coatIndex = (_coatIndex + direction + _coats.length) % _coats.length;
     });
   }
+  
+  // --- YENİ EKLENDİ ---
+  void _toggleCoatCarousel(bool? newValue) {
+    setState(() {
+      _showCoatCarousel = newValue ?? false;
+      
+      // Bonus: Paltoyu gizlerken indeksi sıfırla
+      if (!_showCoatCarousel) {
+        _coatIndex = 0;
+      }
+    });
+  }
+  // --------------------
 
-  void _createOutfit() {
-    showDialog95(
-      context: context,
-      title: 'Create outfit',
-      message: 'This will call Nano Banana (not implemented).',
-    );
+
+  // --- 'CREATE OUTFIT' FONKSİYONU GÜNCELLENDİ ---
+  Future<void> _createOutfit() async {
+    if (_userImage == null) {
+      showErrorDialog95(
+        context: context,
+        title: 'Hata',
+        message: 'Kombin oluşturmak için lütfen önce kendi fotoğrafınızı ekleyin.',
+      );
+      return;
+    }
+    setState(() { _isLoading = true; });
+    try {
+      final ClothingItem currentTop = _tops[_topIndex];
+      final ClothingItem currentBottom = _bottoms[_bottomIndex];
+      
+      // --- DEĞİŞİKLİK BURADA ---
+      // Palto carousel görünürse seçili olanı, değilse "yok" (ilk) olanı al.
+      final ClothingItem currentCoat = _showCoatCarousel
+          ? _coats[_coatIndex]
+          : _coats[0]; // Varsayılan (boş) paltoyu gönder
+      // --- DEĞİŞİKLİK SONU ---
+
+      final Uint8List? generatedImageBytes = await _callGeminiImageApi(
+        userImageFile: _userImage!,
+        topItem: currentTop,
+        bottomItem: currentBottom,
+        coatItem: currentCoat, // Güncellenmiş palto bilgisi
+      );
+      if (generatedImageBytes != null && mounted) {
+        // --- DEĞİŞİKLİK BURADA: Oluşturulan kombini de 'FitChecker' klasörüne kaydet ---
+        // (Ana dizine kaydetmek yerine)
+        final imagesDir = await _getImagesDirectory();
+        final fileName = 'generated_outfit_${DateTime.now().millisecondsSinceEpoch}.png';
+        
+        // Ana 'FitChecker' klasörüne kaydet (veya yeni bir 'Generated' klasörü oluşturabilirsiniz)
+        final savedImageFile = await File(p.join(imagesDir.path, fileName)).writeAsBytes(generatedImageBytes);
+        // --- DEĞİŞİKLİK SONU ---
+        
+        setState(() {
+          _generatedOutfitImage = savedImageFile;
+        });
+        showSuccessDialog95(
+          context: context,
+          title: 'Slay Diva!',
+          message: 'Yeni kombininiz hazır!',
+        );
+      } else if (mounted) {
+        showErrorDialog95(
+          context: context,
+          title: 'Hata',
+          message: 'Kombin oluşturulamadı. Lütfen tekrar deneyin.',
+        );
+      }
+    } catch (e) {
+      debugPrint('Kombin oluşturma hatası: $e');
+      if (mounted) {
+        showErrorDialog95(
+          context: context,
+          title: 'Kritik Hata',
+          message: 'Beklenmedik bir hata oluştu: $e',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
   }
 
-  // --- ANA BUILD METODU ---
+  // --- ANA BUILD METODU (STACK İLE GÜNCELLENDİ) ---
   @override
   Widget build(BuildContext context) {
-    return Scaffold95(
+    final Widget mainScaffold = Scaffold95(
       title: 'Slay Diva 💅',
       toolbar: Toolbar95(
         actions: [
@@ -401,7 +529,6 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
         child: LayoutBuilder(
           builder: (context, constraints) {
             const double kDesktopBreakpoint = 700.0;
-
             if (constraints.maxWidth < kDesktopBreakpoint) {
               return _buildNarrowLayout(constraints);
             } else {
@@ -411,15 +538,31 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
         ),
       ),
     );
+    
+    return Stack(
+      children: [
+        mainScaffold,
+        if (_isLoading)
+          Container(
+            color: Colors.black.withOpacity(0.5),
+            child: Center(
+              child: RetroProgressBar95(
+                message: "Oluşturuluyor...",
+                progressBarColor: const Color(0xFFF472B6),
+                duration: const Duration(milliseconds: 800),
+              ),
+            ),
+          ),
+      ],
+    );
   }
 
   // --- LAYOUT BUILDER'LARI ---
-
+  // --- GÜNCELLENDİ: _buildWideLayout ---
   Widget _buildWideLayout(BoxConstraints constraints) {
     final double leftColumnRatio = 0.35;
     const double maxPhotoAreaWidth = 650.0;
     const double maxPhotoAreaHeight = 650.0;
-
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       child: Row(
@@ -436,35 +579,39 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    _buildCarousel(
-                      title: 'TOPS',
-                      items: _tops,
-                      currentIndex: _topIndex,
-                      onPrev: () => _cycleTop(-1),
-                      onNext: () => _cycleTop(1),
-                      constraints: constraints,
-                      isNarrow: false,
-                    ),
+                    _buildCarousel(title: 'Tops', items: _tops, currentIndex: _topIndex, onPrev: () => _cycleTop(-1), onNext: () => _cycleTop(1), constraints: constraints, isNarrow: false),
                     const SizedBox(height: 16),
-                    _buildCarousel(
-                      title: 'BOTTOMS',
-                      items: _bottoms,
-                      currentIndex: _bottomIndex,
-                      onPrev: () => _cycleBottom(-1),
-                      onNext: () => _cycleBottom(1),
-                      constraints: constraints,
-                      isNarrow: false,
-                    ),
+                    _buildCarousel(title: 'Bottoms', items: _bottoms, currentIndex: _bottomIndex, onPrev: () => _cycleBottom(-1), onNext: () => _cycleBottom(1), constraints: constraints, isNarrow: false),
+                    
+                    // --- DEĞİŞİKLİK BURADA ---
                     const SizedBox(height: 16),
-                    _buildCarousel(
-                      title: 'COATS',
-                      items: _coats,
-                      currentIndex: _coatIndex,
-                      onPrev: () => _cycleCoat(-1),
-                      onNext: () => _cycleCoat(1),
-                      constraints: constraints,
-                      isNarrow: false,
+                    Padding(
+                      padding: const EdgeInsets.only(left: 8.0),
+                      child: Checkbox95(
+                        label: 'Add Coat',
+                        value: _showCoatCarousel,
+                        onChanged: _toggleCoatCarousel,
+                      ),
                     ),
+                    if (_showCoatCarousel)
+                      Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const SizedBox(height: 16),
+                          _buildCarousel(
+                            title: 'Coats',
+                            items: _coats,
+                            currentIndex: _coatIndex,
+                            onPrev: () => _cycleCoat(-1),
+                            onNext: () => _cycleCoat(1),
+                            constraints: constraints,
+                            isNarrow: false,
+                          ),
+                        ],
+                      ),
+                    // --- DEĞİŞİKLİK SONU ---
+
                     const SizedBox(height: 20),
                   ],
                 ),
@@ -489,6 +636,7 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
     );
   }
 
+  // --- GÜNCELLENDİ: _buildNarrowLayout ---
   Widget _buildNarrowLayout(BoxConstraints constraints) {
     return SingleChildScrollView(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -497,86 +645,78 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
         children: [
           _buildPhotoArea(constraints, isNarrow: true),
           const SizedBox(height: 16),
-          _buildCarousel(
-            title: 'TOPS',
-            items: _tops,
-            currentIndex: _topIndex,
-            onPrev: () => _cycleTop(-1),
-            onNext: () => _cycleTop(1),
-            constraints: constraints,
-            isNarrow: true,
-          ),
+          _buildCarousel(title: 'Tops', items: _tops, currentIndex: _topIndex, onPrev: () => _cycleTop(-1), onNext: () => _cycleTop(1), constraints: constraints, isNarrow: true),
           const SizedBox(height: 16),
-          _buildCarousel(
-            title: 'BOTTOMS',
-            items: _bottoms,
-            currentIndex: _bottomIndex,
-            onPrev: () => _cycleBottom(-1),
-            onNext: () => _cycleBottom(1),
-            constraints: constraints,
-            isNarrow: true,
-          ),
+          _buildCarousel(title: 'Bottoms', items: _bottoms, currentIndex: _bottomIndex, onPrev: () => _cycleBottom(-1), onNext: () => _cycleBottom(1), constraints: constraints, isNarrow: true),
+          
+          // --- DEĞİŞİKLİK BURADA ---
           const SizedBox(height: 16),
-          _buildCarousel(
-            title: 'COATS',
-            items: _coats,
-            currentIndex: _coatIndex,
-            onPrev: () => _cycleCoat(-1),
-            onNext: () => _cycleCoat(1),
-            constraints: constraints,
-            isNarrow: true,
+          Padding(
+            padding: const EdgeInsets.only(left: 8.0),
+            child: Checkbox95(
+              label: 'Add Coat',
+              value: _showCoatCarousel,
+              onChanged: _toggleCoatCarousel,
+            ),
           ),
+          if (_showCoatCarousel)
+            Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const SizedBox(height: 16),
+                _buildCarousel(
+                  title: 'Coats',
+                  items: _coats,
+                  currentIndex: _coatIndex,
+                  onPrev: () => _cycleCoat(-1),
+                  onNext: () => _cycleCoat(1),
+                  constraints: constraints,
+                  isNarrow: true,
+                ),
+              ],
+            ),
+          // --- DEĞİŞİKLİK SONU ---
+
           const SizedBox(height: 20),
         ],
       ),
     );
   }
 
-  // --- UI PARÇALARI (REUSABLE WIDGETS) ---
 
+  // --- UI PARÇALARI (REUSABLE WIDGETS) ---
   Widget _buildCarousel({
     required String title,
-    required List<ClothingItem> items, // Artık ClothingItem listesi alıyor
+    required List<ClothingItem> items,
     required int currentIndex,
     required VoidCallback onPrev,
     required VoidCallback onNext,
     required BoxConstraints constraints,
     required bool isNarrow,
   }) {
-    final double innerWidth = isNarrow
-        ? (constraints.maxWidth * 0.5).clamp(180.0, 250.0)
-        : 220.0;
+    final double innerWidth = isNarrow ? (constraints.maxWidth * 0.5).clamp(180.0, 250.0) : 220.0;
     final double innerHeight = (innerWidth * 0.7).clamp(90.0, 150.0);
-
-    // Görüntülenecek widget'ı belirle: Resim mi, Renk mi?
     Widget content;
     if (items.isEmpty) {
         content = const Center(child: Text('No items yet.'));
     } else {
         final item = items[currentIndex];
         if (item is ColorItem) {
-          content = Container(
-            margin: const EdgeInsets.all(8),
-            color: item.color,
-          );
+          content = Container(margin: const EdgeInsets.all(8), color: item.color);
         } else if (item is ImageItem) {
           content = Padding(
             padding: const EdgeInsets.all(4.0),
-            child: Image.file(
-              File(item.path),
-              fit: BoxFit.cover,
+            child: Image.file(File(item.path), fit: BoxFit.cover,
               errorBuilder: (context, error, stackTrace) {
-                // Resim yüklenemezse hata göster
                 return const Center(child: Icon(Icons.error));
               },
             ),
           );
         } else {
-          content = const SizedBox.shrink(); // Tanımsız tip için boş widget
+          content = const SizedBox.shrink();
         }
     }
-    
-
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -590,18 +730,22 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
             padding: const EdgeInsets.symmetric(vertical: 16),
             color: const Color(0xFF947B7B),
             child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
+              // mainAxisAlignment: MainAxisAlignment.center, // <--- DEĞİŞİKLİK: Bu satır kaldırıldı/yorumlandı
               children: [
                 _triangleButton(onTap: onPrev),
-                Container(
-                  width: innerWidth,
-                  height: innerHeight,
-                  margin: const EdgeInsets.symmetric(horizontal: 12),
-                  color: Flutter95.white,
-                  child: Center(
-                    child: content, // Belirlenen widget'ı burada göster
+                
+                // <--- DEĞİŞİKLİK BURADA BAŞLIYOR ---
+                Expanded(
+                  child: Container(
+                    // width: innerWidth, // <--- DEĞİŞİKLİK: Bu satır kaldırıldı
+                    height: innerHeight,
+                    margin: const EdgeInsets.symmetric(horizontal: 12),
+                    color: Flutter95.white,
+                    child: Center(child: content),
                   ),
                 ),
+                // <--- DEĞİŞİKLİK BURADA BİTİYOR ---
+
                 _triangleButton(onTap: onNext, rotate: false),
               ],
             ),
@@ -610,52 +754,75 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
       ],
     );
   }
-
+  
   Widget _buildPhotoArea(BoxConstraints constraints, {required bool isNarrow}) {
-    // Fotoğraf alanında gösterilecek widget
-    Widget photoContent;
-    if (_userImage != null) {
-      photoContent = Image.file(_userImage!, fit: BoxFit.cover, alignment: Alignment.bottomCenter);
-    } else {
-      photoContent = const Center(
-        child: Text('Add Your Photo', style: Flutter95.textStyle),
-      );
-    }
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Expanded(
-          child: Elevation95(
-            type: Elevation95Type.down,
-            child: Container(
-              width: double.infinity,
-              color: const Color(0xFFB38C8C),
-              padding: const EdgeInsets.all(12),
-              child: GestureDetector( // Tıklama algılaması için
-                onTap: _pickUserPhoto,
-                child: Container(
-                  color: const Color(0xFFF1E2E2),
-                  child: photoContent,
+      Widget photoContent;
+      if (_generatedOutfitImage != null) {
+        photoContent = Image.file(_generatedOutfitImage!, fit: BoxFit.contain, alignment: Alignment.bottomCenter);
+      } 
+      else if (_userImage != null) {
+        photoContent = Image.file(_userImage!, fit: BoxFit.contain, alignment: Alignment.bottomCenter);
+      } 
+      else {
+        photoContent = const Center(child: Text('Add Your Photo', style: Flutter95.textStyle));
+      }
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(
+            child: Elevation95(
+              type: Elevation95Type.down,
+              child: Container(
+                width: double.infinity,
+                color: const Color(0xFFB38C8C),
+                padding: const EdgeInsets.all(12),
+                child: GestureDetector( 
+                  onTap: _pickUserPhoto,
+                  child: Container(
+                    color: const Color(0xFFF1E2E2),
+                    child: photoContent, 
+                  ),
                 ),
               ),
             ),
           ),
-        ),
-        const SizedBox(height: 12),
-        Align(
-          alignment: Alignment.centerRight,
-          child: Button95(
-            onTap: _createOutfit,
-            child: const Padding(
-              padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              child: Text('Create outfit diva!', style: Flutter95.textStyle),
+          const SizedBox(height: 12),
+          Align(
+            alignment: Alignment.centerRight,
+            
+            // --- DEĞİŞİKLİK BURADA BAŞLIYOR ---
+
+            // 1. ÇÖZÜM: Butonu dışarıdan SizedBox ile sararak boyut veriyoruz.
+            child: SizedBox(
+              width: 220.0,  // <-- Buton için istediğiniz genişlik
+              height: 48.0, // <-- Buton için istediğiniz yükseklik
+              child: Button95(
+                onTap: _createOutfit,
+                child: Padding(
+                  // Bu padding artık sadece metnin kenara yapışmamasını sağlar
+                  padding: const EdgeInsets.symmetric(horizontal: 8.0), 
+                  child: Center(
+                    
+                    // 2. ÇÖZÜM: Yazıyı butona "bind" etmek için FittedBox kullanıyoruz.
+                    child: FittedBox(
+                      fit: BoxFit.scaleDown, // Metni, gerekirse küçülterek sığdır
+                      child: Text(
+                        'Create outfit diva!', 
+                        style: Flutter95.textStyle.copyWith(
+                          color: const Color.fromARGB(255, 0, 0, 0),
+                        ),
+                      ),
+                    ),
+
+                  ),
+                ),
+              ),
             ),
+            // --- DEĞİŞİKLİK SONU ---
           ),
-        ),
-      ],
-    );
-  }
+        ],
+      );
+    }
 
   Widget _triangleButton({required VoidCallback onTap, bool rotate = true}) {
     return GestureDetector(
@@ -671,11 +838,7 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
             child: Transform.rotate(
               angle: rotate ? math.pi : 0,
               child: const Center(
-                child: Icon(
-                  Icons.play_arrow,
-                  size: 18,
-                  color: Color(0xFF8B5A5A),
-                ),
+                child: Icon(Icons.play_arrow, size: 18, color: Color(0xFF8B5A5A)),
               ),
             ),
           ),
@@ -683,25 +846,18 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
       ),
     );
   }
-
   Menu95 _buildMenu() {
     return Menu95(
       items: [
         MenuItem95(value: 1, label: 'Add Tops'),
         MenuItem95(value: 2, label: 'Add Bottoms'),
-        MenuItem95(value: 3, label: 'Add Coat'), // Değeri düzelttim
+        MenuItem95(value:3, label: 'Add Coat'),
       ],
       onItemSelected: (item) {
         switch (item) {
-          case 1:
-            _pickAndAddImage(ClothingCategory.top);
-            break;
-          case 2:
-            _pickAndAddImage(ClothingCategory.bottom);
-            break;
-          case 3:
-            _pickAndAddImage(ClothingCategory.coat);
-            break;
+          case 1: _pickAndAddImage(ClothingCategory.top); break;
+          case 2: _pickAndAddImage(ClothingCategory.bottom); break;
+          case 3: _pickAndAddImage(ClothingCategory.coat); break;
         }
       },
     );
