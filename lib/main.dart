@@ -297,6 +297,154 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
       } else { /*...*/ return null; }
     } catch (e) { /*...*/ return null; }
   }
+
+  Future<Uint8List?> _callGeminiImageApiWithPrompt({
+    required File userImageFile,
+    required String prompt,
+    required List<ClothingItem> allTops,
+    required List<ClothingItem> allBottoms,
+    required List<ClothingItem> allCoats,
+  }) async {
+    final String? apiKey = dotenv.env['GOOGLE_API_KEY']?.trim();
+    if (apiKey == null || apiKey.isEmpty) {
+      debugPrint("HATA: .env dosyasında GOOGLE_API_KEY bulunamadı.");
+      debugPrint("--- SİMÜLASYON MODU (PROMPT) ---");
+      await Future.delayed(const Duration(seconds: 3));
+      // Simülasyon için rastgele bir 'top' döndür
+      final imageItems = allTops.whereType<ImageItem>().toList();
+      if (imageItems.isNotEmpty) {
+        return await File(imageItems.first.path).readAsBytes();
+      }
+      return null;
+    }
+
+    const String modelName = 'gemini-2.5-flash-image';
+    final uri = Uri.parse(
+        'https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$apiKey');
+
+    // --- YENİ PROMPT MANTIĞI ---
+    List<Map<String, dynamic>> parts = [];
+
+    // 1. Ana Talimat ve Prompt
+    String textPrompt = """
+    You are an expert fashion stylist. 
+    Your task is to dress the person in the user image based on this specific user request: '$prompt'.
+
+    You MUST select ONE top, ONE bottom, and (if appropriate for the request) ONE coat 
+    from the lists of options provided below. Do not use any clothing not in these lists.
+
+    Dress the person realistically. Do NOT change the person's face, body, or pose.
+    First, here is the user to dress:
+    """;
+    parts.add({"text": textPrompt});
+
+    // 2. Kullanıcı Resmi
+    final userImageBytes = await userImageFile.readAsBytes();
+    parts.add({
+      "inlineData": {"mimeType": "image/png", "data": base64Encode(userImageBytes)}
+    });
+
+    // 3. TÜM KIYAFET SEÇENEKLERİNİ EKLE
+    
+    // Top'lar
+    parts.add({"text": "--- AVAILABLE TOPS ---"});
+    for (int i = 0; i < allTops.length; i++) {
+      final item = allTops[i];
+      if (item is ImageItem) {
+        parts.add({"text": "Top Option ${i + 1}:"});
+        parts.add({
+          "inlineData": {
+            "mimeType": "image/png",
+            "data": base64Encode(await File(item.path).readAsBytes())
+          }
+        });
+      } else if (item is ColorItem) {
+        parts.add({
+          "text": "Top Option ${i + 1}: Solid color ${_colorToHex(item.color)}"
+        });
+      }
+    }
+
+    // Bottom'lar
+    parts.add({"text": "--- AVAILABLE BOTTOMS ---"});
+    for (int i = 0; i < allBottoms.length; i++) {
+      final item = allBottoms[i];
+      if (item is ImageItem) {
+        parts.add({"text": "Bottom Option ${i + 1}:"});
+        parts.add({
+          "inlineData": {
+            "mimeType": "image/png",
+            "data": base64Encode(await File(item.path).readAsBytes())
+          }
+        });
+      } else if (item is ColorItem) {
+        parts.add({
+          "text": "Bottom Option ${i + 1}: Solid color ${_colorToHex(item.color)}"
+        });
+      }
+    }
+
+    // Coat'lar
+    parts.add({"text": "--- AVAILABLE COATS ---"});
+    for (int i = 0; i < allCoats.length; i++) {
+      final item = allCoats[i];
+      if (item is ImageItem) {
+        parts.add({"text": "Coat Option ${i + 1}:"});
+        parts.add({
+          "inlineData": {
+            "mimeType": "image/png",
+            "data": base64Encode(await File(item.path).readAsBytes())
+          }
+        });
+      } else if (item is ColorItem) {
+        // Varsayılan rengi (None) göndermeyebiliriz, ama listeye dahil etmek
+        // modelin "hiçbiri" seçeneğini anlamasına yardımcı olabilir.
+        parts.add({
+          "text": "Coat Option ${i + 1}: Solid color ${_colorToHex(item.color)}"
+        });
+      }
+    }
+
+    // 4. Son Talimat
+    parts.add({
+      "text":
+          "Now, generate the final image of the person wearing the outfit you selected from the lists above based on the user request: '$prompt'."
+    });
+    // --- PROMPT MANTIĞI SONU ---
+
+    final requestBody = jsonEncode({
+      "contents": [
+        {"parts": parts}
+      ]
+    });
+
+    try {
+      final response = await http.post(uri,
+          headers: {'Content-Type': 'application/json'}, body: requestBody);
+
+      if (response.statusCode == 200) {
+        final responseData = jsonDecode(response.body);
+        final List<dynamic> responseParts =
+            responseData['candidates'][0]['content']['parts'];
+        for (var part in responseParts) {
+          if (part.containsKey('inlineData')) {
+            final String base64ImageData = part['inlineData']['data'];
+            return base64Decode(base64ImageData);
+          }
+        }
+        return null;
+      } else {
+        debugPrint(
+            'API Hatası (Prompt): ${response.statusCode} - ${response.body}');
+        return null;
+      }
+    } catch (e) {
+      debugPrint('API Çağrısı (Prompt) Hatası: $e');
+      return null;
+    }
+  }
+
+  
   
   // --- RESİM SEÇME VE EKLEME FONKSİYONLARI ---
 
@@ -480,6 +628,84 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
         final savedImageFile = await File(p.join(imagesDir.path, fileName)).writeAsBytes(generatedImageBytes);
         // --- DEĞİŞİKLİK SONU ---
         
+        setState(() {
+          _generatedOutfitImage = savedImageFile;
+        });
+        showSuccessDialog95(
+          context: context,
+          title: 'Slay Diva!',
+          message: 'Yeni kombininiz hazır!',
+        );
+      } else if (mounted) {
+        showErrorDialog95(
+          context: context,
+          title: 'Hata',
+          message: 'Kombin oluşturulamadı. Lütfen tekrar deneyin.',
+        );
+      }
+    } catch (e) {
+      debugPrint('Kombin oluşturma hatası: $e');
+      if (mounted) {
+        showErrorDialog95(
+          context: context,
+          title: 'Kritik Hata',
+          message: 'Beklenmedik bir hata oluştu: $e',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _createOutfitFromCustomPrompt() async {
+    // 1. ADIM: Kullanıcıdan prompt'u al
+    final String? customPrompt = await _showPromptDialog();
+
+    // 2. ADIM: Kullanıcı "Cancel" demezse veya boş geçmezse devam et
+    if (customPrompt == null || customPrompt.trim().isEmpty) {
+      return; // Kullanıcı iptal etti
+    }
+
+    // 3. ADIM: Kullanıcı fotoğrafı kontrolü (mevcut kodunuz)
+    if (_userImage == null) {
+      showErrorDialog95(
+        context: context,
+        title: 'Hata',
+        message: 'Kombin oluşturmak için lütfen önce kendi fotoğrafınızı ekleyin.',
+      );
+      return;
+    }
+
+    setState(() { _isLoading = true; });
+
+    try {
+      // --- DEĞİŞİKLİK BURADA BAŞLIYOR ---
+      // Artık _topIndex, _bottomIndex gibi mevcut seçimleri KULLANMIYORUZ.
+      // Bunun yerine, Gemini'ye prompt'u ve TÜM listeleri gönderiyoruz.
+      // Gemini'nin bu listelerden en uygun olanı seçmesini istiyoruz.
+
+      final Uint8List? generatedImageBytes =
+          await _callGeminiImageApiWithPrompt(
+        userImageFile: _userImage!,
+        prompt: customPrompt, // Kullanıcıdan alınan prompt
+        allTops: _tops, // Tüm üst giyim listesi
+        allBottoms: _bottoms, // Tüm alt giyim listesi
+        allCoats: _coats, // Tüm palto listesi
+      );
+      // --- DEĞİŞİKLİK SONU ---
+
+      if (generatedImageBytes != null && mounted) {
+        // Geri kalan kaydetme ve başarı gösterme mantığı SİZİN KODUNUZLA AYNI
+        final imagesDir = await _getImagesDirectory();
+        final fileName =
+            'generated_outfit_${DateTime.now().millisecondsSinceEpoch}.png';
+        final savedImageFile = await File(p.join(imagesDir.path, fileName))
+            .writeAsBytes(generatedImageBytes);
+
         setState(() {
           _generatedOutfitImage = savedImageFile;
         });
@@ -754,75 +980,138 @@ class _FitCheckerHomeState extends State<FitCheckerHome> {
       ],
     );
   }
+
+  // Sınıfınızın içinde (örn: _buildPhotoArea'nın üstüne) ekleyin
+  Future<String?> _showPromptDialog() async {
+    final TextEditingController promptController = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      builder: (context) {
+        // flutter_95 stiline uyması için standart AlertDialog'u
+        // Button95 ve Flutter95.textStyle ile özelleştiriyoruz.
+        return AlertDialog(
+          title: Text('Enter Custom Prompt', style: Flutter95.textStyle),
+          content: TextField(
+            controller: promptController,
+            decoration: const InputDecoration(
+              hintText: "e.g., 'a formal office look'",
+            ),
+            style: Flutter95.textStyle,
+            autofocus: true,
+          ),
+          backgroundColor: const Color(0xFFc0c0c0), // Windows 95 grisi
+          actions: [
+            Button95(
+              onTap: () => Navigator.of(context).pop(),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8.0),
+                child: Text('Cancel', style: Flutter95.textStyle),
+              ),
+            ),
+            Button95(
+              onTap: () => Navigator.of(context).pop(promptController.text),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8.0),
+                child: Text('OK', style: Flutter95.textStyle),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
   
   Widget _buildPhotoArea(BoxConstraints constraints, {required bool isNarrow}) {
-      Widget photoContent;
-      if (_generatedOutfitImage != null) {
-        photoContent = Image.file(_generatedOutfitImage!, fit: BoxFit.contain, alignment: Alignment.bottomCenter);
-      } 
-      else if (_userImage != null) {
-        photoContent = Image.file(_userImage!, fit: BoxFit.contain, alignment: Alignment.bottomCenter);
-      } 
-      else {
-        photoContent = const Center(child: Text('Add Your Photo', style: Flutter95.textStyle));
-      }
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Expanded(
-            child: Elevation95(
-              type: Elevation95Type.down,
-              child: Container(
-                width: double.infinity,
-                color: const Color(0xFFB38C8C),
-                padding: const EdgeInsets.all(12),
-                child: GestureDetector( 
-                  onTap: _pickUserPhoto,
-                  child: Container(
-                    color: const Color(0xFFF1E2E2),
-                    child: photoContent, 
-                  ),
+    Widget photoContent;
+    if (_generatedOutfitImage != null) {
+      photoContent = Image.file(_generatedOutfitImage!,
+          fit: BoxFit.contain, alignment: Alignment.bottomCenter);
+    } else if (_userImage != null) {
+      photoContent = Image.file(_userImage!,
+          fit: BoxFit.contain, alignment: Alignment.bottomCenter);
+    } else {
+      photoContent =
+          const Center(child: Text('Add Your Photo', style: Flutter95.textStyle));
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Expanded(
+          child: Elevation95(
+            type: Elevation95Type.down,
+            child: Container(
+              width: double.infinity,
+              color: const Color(0xFFB38C8C),
+              padding: const EdgeInsets.all(12),
+              child: GestureDetector(
+                onTap: _pickUserPhoto,
+                child: Container(
+                  color: const Color(0xFFF1E2E2),
+                  child: photoContent,
                 ),
               ),
             ),
           ),
-          const SizedBox(height: 12),
-          Align(
-            alignment: Alignment.centerRight,
-            
-            // --- DEĞİŞİKLİK BURADA BAŞLIYOR ---
+        ),
+        const SizedBox(height: 12),
 
-            // 1. ÇÖZÜM: Butonu dışarıdan SizedBox ile sararak boyut veriyoruz.
-            child: SizedBox(
-              width: 220.0,  // <-- Buton için istediğiniz genişlik
-              height: 48.0, // <-- Buton için istediğiniz yükseklik
-              child: Button95(
-                onTap: _createOutfit,
-                child: Padding(
-                  // Bu padding artık sadece metnin kenara yapışmamasını sağlar
-                  padding: const EdgeInsets.symmetric(horizontal: 8.0), 
-                  child: Center(
-                    
-                    // 2. ÇÖZÜM: Yazıyı butona "bind" etmek için FittedBox kullanıyoruz.
-                    child: FittedBox(
-                      fit: BoxFit.scaleDown, // Metni, gerekirse küçülterek sığdır
-                      child: Text(
-                        'Create outfit diva!', 
-                        style: Flutter95.textStyle.copyWith(
-                          color: const Color.fromARGB(255, 0, 0, 0),
-                        ),
+        // --- YENİ BUTON BAŞLANGIÇ ---
+        Align(
+          alignment: Alignment.centerRight,
+          child: SizedBox(
+            width: 220.0, // Genişliği mevcut butonla aynı tuttum
+            height: 48.0, // Yüksekliği mevcut butonla aynı tuttum
+            child: Button95(
+              onTap: _createOutfitFromCustomPrompt, 
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8.0),
+                child: Center(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: Text(
+                      'Enter custom prompt', // <-- YENİ BUTON METNİ
+                      style: Flutter95.textStyle.copyWith(
+                        color: const Color.fromARGB(255, 0, 0, 0),
                       ),
                     ),
-
                   ),
                 ),
               ),
             ),
-            // --- DEĞİŞİKLİK SONU ---
           ),
-        ],
-      );
-    }
+        ),
+        // --- YENİ BUTON SON ---
+
+        const SizedBox(height: 8), // <-- İki buton arasına boşluk ekledim
+
+        // --- MEVCUT BUTON ---
+        Align(
+          alignment: Alignment.centerRight,
+          child: SizedBox(
+            width: 220.0, // <-- Buton için istediğiniz genişlik
+            height: 48.0, // <-- Buton için istediğiniz yükseklik
+            child: Button95(
+              onTap: _createOutfit,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8.0),
+                child: Center(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: Text(
+                      'Create outfit diva!',
+                      style: Flutter95.textStyle.copyWith(
+                        color: const Color.fromARGB(255, 0, 0, 0),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
 
   Widget _triangleButton({required VoidCallback onTap, bool rotate = true}) {
     return GestureDetector(
